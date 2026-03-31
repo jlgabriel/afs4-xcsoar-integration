@@ -27,6 +27,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
+VERSION = "1.0.0"
+
 # Default configuration
 DEFAULT_UDP_PORT = 49002          # Aerofly FS4 default UDP port
 DEFAULT_TCP_PORT = 4353           # Port for TCP server (for XCSoar to connect)
@@ -590,7 +592,7 @@ class AeroflyToXCSoar:
 
     def start_services(self):
         """Start all background services (receiver, TCP server, processing loop)."""
-        print(f"Starting Aerofly FS4 to XCSoar NMEA converter v4.0...")
+        print(f"Starting Aerofly FS4 to XCSoar NMEA converter v{VERSION}...")
         print(f"UDP Port: {self.udp_port}, TCP Port: {self.tcp_port}")
         print(f"Update rate: {self.update_rate} Hz, Magnetic variation: {self.magnetic_variation}°")
         print(f"Debug level: {self.debug_level}")
@@ -742,7 +744,7 @@ class BridgeGUI:
         self.bridge = bridge
 
         self.root = tk.Tk()
-        self.root.title("AFS4 → XCSoar Bridge")
+        self.root.title(f"AFS4 → XCSoar Bridge v{VERSION}")
         self.root.geometry("420x380")
         self.root.resizable(False, False)
         self.root.configure(bg=self.COLOR_BG)

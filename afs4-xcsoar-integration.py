@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025
+# Copyright (c) 2026 Juan Luis Gabriel
 # Aerofly FS4 to XCSoar NMEA Converter
 # This software is released under the MIT License.
 

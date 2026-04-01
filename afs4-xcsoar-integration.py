@@ -16,6 +16,9 @@ The program can be used with XCSoar running on:
 
 import socket
 import threading
+import struct
+import math
+import mmap
 import re
 import time
 import datetime
@@ -27,7 +30,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # Default configuration
 DEFAULT_UDP_PORT = 49002          # Aerofly FS4 default UDP port
@@ -38,16 +41,21 @@ DEFAULT_DEBUG_LEVEL = 1           # Debug level: 0=minimal, 1=normal, 2=verbose
 
 @dataclass
 class GPSData:
-    """Store GPS data received from Aerofly FS4 (or DLL in the future)."""
+    """Store GPS data received from Aerofly FS4 (UDP or DLL)."""
     longitude: float = 0.0
     latitude: float = 0.0
     altitude: float = 0.0          # MSL altitude in meters
     track: float = 0.0
     ground_speed: float = 0.0      # m/s
     timestamp: float = 0.0
-    # Extended fields (calculated from UDP, direct from DLL in the future)
+    # Extended fields (calculated from UDP, or direct from DLL)
     vertical_speed: Optional[float] = None    # m/s, None = not yet available
     barometric_altitude: Optional[float] = None  # meters, None = use MSL altitude
+    # DLL-only fields
+    indicated_airspeed: Optional[float] = None   # m/s (IAS from DLL)
+    wind_x: Optional[float] = None               # m/s (wind vector X component)
+    wind_y: Optional[float] = None               # m/s (wind vector Y component)
+    wind_z: Optional[float] = None               # m/s (wind vector Z component)
 
 @dataclass
 class AttitudeData:
@@ -199,6 +207,260 @@ class AeroflyReceiver:
         if self.socket:
             self.socket.close()
 
+
+class DLLReader:
+    """
+    Reads flight data from AeroflyReader DLL via Windows Shared Memory.
+    Provides high-quality data at 50-60Hz including IAS, direct vario, and wind.
+    Falls back gracefully when DLL is not available.
+
+    Shared memory layout based on AeroflyReaderData struct in aerofly_reader_dll.cpp.
+    """
+    MAPPING_NAME = "AeroflyReaderData"
+    POLL_INTERVAL = 0.02   # 50Hz read rate
+    RECONNECT_INTERVAL = 3.0  # seconds between reconnect attempts
+    STALE_TIMEOUT = 2.0    # seconds before data is considered stale
+
+    # Offsets calculated from AeroflyReaderData C++ struct layout:
+    # Header: uint64(8) + uint32(4) + uint32(4) = 16 bytes
+    # Position/Orientation: 8 doubles = 64 bytes
+    # Speeds: 5 doubles = 40 bytes
+    # Physics vectors: 4 x tm_vector3d(3 doubles) = 96 bytes
+    # Aircraft state: 5 doubles, Engine: 4 doubles, Nav: 6, AP: 5, VSpeeds: 5
+    _OFF_TIMESTAMP = 0           # uint64_t
+    _OFF_DATA_VALID = 8          # uint32_t
+    _OFF_UPDATE_COUNTER = 12     # uint32_t
+    _OFF_LATITUDE = 16           # double (radians)
+    _OFF_LONGITUDE = 24          # double (radians)
+    _OFF_ALTITUDE = 32           # double (meters MSL)
+    _OFF_HEIGHT = 40             # double (meters AGL)
+    _OFF_PITCH = 48              # double (radians)
+    _OFF_BANK = 56               # double (radians)
+    _OFF_TRUE_HEADING = 64       # double (radians)
+    _OFF_MAGNETIC_HEADING = 72   # double (radians)
+    _OFF_IAS = 80                # double (m/s)
+    _OFF_GROUND_SPEED = 88       # double (m/s)
+    _OFF_VERTICAL_SPEED = 96     # double (m/s)
+    # Physics vectors start at offset 120 (after 5 speed doubles ending at 112+8=120)
+    # position(24) + velocity(24) + acceleration(24) + wind(24) = 96 bytes
+    _OFF_WIND_X = 192            # double (m/s) — wind vector starts at 120+72=192
+    _OFF_WIND_Y = 200            # double (m/s)
+    _OFF_WIND_Z = 208            # double (m/s)
+    # Minimum shared memory size needed for the fields we read
+    _MIN_SIZE = 216
+
+    def __init__(self, debug_level: int = DEFAULT_DEBUG_LEVEL):
+        self.debug_level = debug_level
+        self._mmap: Optional[mmap.mmap] = None
+        self._connected = False
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_counter = 0
+        self._last_valid_time = 0.0
+        # Public data (updated by reader thread)
+        self.gps_data = GPSData()
+        self.attitude_data = AttitudeData()
+
+    def start(self):
+        """Start the DLL reader thread."""
+        if sys.platform != 'win32':
+            print("DLL shared memory is only available on Windows.")
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        print("DLL reader started, looking for AeroflyReader shared memory...")
+
+    def _try_connect(self) -> bool:
+        """Attempt to open the shared memory mapping."""
+        try:
+            self._mmap = mmap.mmap(-1, 1024, self.MAPPING_NAME, access=mmap.ACCESS_READ)
+            self._connected = True
+            if self.debug_level >= 1:
+                print(f"Connected to DLL shared memory: {self.MAPPING_NAME}")
+            return True
+        except Exception:
+            self._cleanup()
+            return False
+
+    def _cleanup(self):
+        """Close shared memory resources."""
+        if self._mmap:
+            try:
+                self._mmap.close()
+            except Exception:
+                pass
+        self._mmap = None
+        self._connected = False
+
+    def _read_double(self, offset: int) -> float:
+        self._mmap.seek(offset)
+        return struct.unpack('d', self._mmap.read(8))[0]
+
+    def _read_uint32(self, offset: int) -> int:
+        self._mmap.seek(offset)
+        return struct.unpack('I', self._mmap.read(4))[0]
+
+    def _read_loop(self):
+        """Main loop: connect, read, reconnect."""
+        last_reconnect = 0.0
+        was_connected = False
+
+        while self._running:
+            if not self._connected:
+                now = time.time()
+                if now - last_reconnect >= self.RECONNECT_INTERVAL:
+                    last_reconnect = now
+                    if self._try_connect() and not was_connected:
+                        was_connected = True
+                else:
+                    time.sleep(0.1)
+                    continue
+
+            try:
+                data_valid = self._read_uint32(self._OFF_DATA_VALID)
+                counter = self._read_uint32(self._OFF_UPDATE_COUNTER)
+
+                if data_valid > 0 and counter != self._last_counter:
+                    self._last_counter = counter
+                    self._last_valid_time = time.time()
+                    self._update_data()
+
+                elif time.time() - self._last_valid_time > self.STALE_TIMEOUT and self._last_valid_time > 0:
+                    if self.debug_level >= 1:
+                        print("DLL data stale, reconnecting...")
+                    self._cleanup()
+                    was_connected = False
+
+            except Exception as e:
+                if self.debug_level >= 1:
+                    print(f"DLL read error: {e}")
+                self._cleanup()
+                was_connected = False
+
+            time.sleep(self.POLL_INTERVAL)
+
+    def _update_data(self):
+        """Read all fields from shared memory and update GPS/attitude data."""
+        now = time.time()
+
+        lat_rad = self._read_double(self._OFF_LATITUDE)
+        lon_rad = self._read_double(self._OFF_LONGITUDE)
+        alt_m = self._read_double(self._OFF_ALTITUDE)
+        height_m = self._read_double(self._OFF_HEIGHT)
+        ias_ms = self._read_double(self._OFF_IAS)
+        gs_ms = self._read_double(self._OFF_GROUND_SPEED)
+        vs_ms = self._read_double(self._OFF_VERTICAL_SPEED)
+        true_hdg_rad = self._read_double(self._OFF_TRUE_HEADING)
+        mag_hdg_rad = self._read_double(self._OFF_MAGNETIC_HEADING)
+        pitch_rad = self._read_double(self._OFF_PITCH)
+        bank_rad = self._read_double(self._OFF_BANK)
+        wind_ecef_x = self._read_double(self._OFF_WIND_X)
+        wind_ecef_y = self._read_double(self._OFF_WIND_Y)
+        wind_ecef_z = self._read_double(self._OFF_WIND_Z)
+
+        # Convert radians to degrees
+        lat_deg = math.degrees(lat_rad)
+        lon_deg = math.degrees(lon_rad)
+        # Normalize longitude: AFS4 DLL returns 0-360, NMEA needs -180/+180
+        if lon_deg > 180.0:
+            lon_deg -= 360.0
+        # AFS4 heading uses math convention (CCW from East axis).
+        # Convert to navigation convention (CW from North): nav = (90 - math) % 360
+        true_hdg_deg = (90.0 - math.degrees(true_hdg_rad)) % 360
+        mag_hdg_deg = (90.0 - math.degrees(mag_hdg_rad)) % 360
+        pitch_deg = math.degrees(pitch_rad)
+        bank_deg = math.degrees(bank_rad)
+
+        # Convert wind from ECEF to local ENU (East-North-Up) frame.
+        # AFS4 Vector3D values are in ECEF: x→(0°N,0°E), y→(0°N,90°E), z→NorthPole
+        # Local East  = (-sin(lon), cos(lon), 0)
+        # Local North = (-sin(lat)*cos(lon), -sin(lat)*sin(lon), cos(lat))
+        sin_lat = math.sin(lat_rad)
+        cos_lat = math.cos(lat_rad)
+        sin_lon = math.sin(lon_rad)
+        cos_lon = math.cos(lon_rad)
+
+        wind_east = -sin_lon * wind_ecef_x + cos_lon * wind_ecef_y
+        wind_north = (-sin_lat * cos_lon * wind_ecef_x
+                      - sin_lat * sin_lon * wind_ecef_y
+                      + cos_lat * wind_ecef_z)
+
+        # Track: use true heading as approximation (DLL only gives scalar groundspeed)
+        track = true_hdg_deg
+
+        self.gps_data = GPSData(
+            longitude=lon_deg,
+            latitude=lat_deg,
+            altitude=alt_m,
+            track=track,
+            ground_speed=gs_ms,
+            timestamp=now,
+            vertical_speed=vs_ms,
+            barometric_altitude=alt_m,
+            indicated_airspeed=ias_ms,
+            wind_x=wind_north,
+            wind_y=0.0,  # vertical wind not used for direction
+            wind_z=wind_east,
+        )
+
+        self.attitude_data = AttitudeData(
+            true_heading=true_hdg_deg,
+            pitch=pitch_deg,
+            roll=bank_deg,
+            timestamp=now,
+        )
+
+    def is_connected(self, timeout=2.0) -> bool:
+        """Check if DLL is actively providing data."""
+        if not self._connected:
+            return False
+        return (time.time() - self._last_valid_time) < timeout
+
+    def stop(self):
+        """Stop the DLL reader."""
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(1.0)
+        self._cleanup()
+
+
+def ias_to_tas(ias_ms: float, altitude_m: float) -> float:
+    """Convert IAS to TAS using the ISA standard atmosphere model.
+
+    Uses the barometric formula for the troposphere (below 11,000m):
+      T = T0 - L * h
+      rho = rho0 * (T / T0) ^ (g/(R*L) - 1)
+      TAS = IAS * sqrt(rho0 / rho)
+
+    Args:
+        ias_ms: Indicated airspeed in m/s
+        altitude_m: Altitude in meters MSL
+
+    Returns:
+        True airspeed in m/s
+    """
+    T0 = 288.15     # ISA sea-level temperature (K)
+    L = 0.0065      # Temperature lapse rate (K/m)
+    g = 9.80665     # Gravitational acceleration (m/s^2)
+    R = 287.058     # Specific gas constant for dry air (J/(kg*K))
+
+    # Clamp altitude to troposphere (ISA model valid up to 11,000m)
+    h = max(0.0, min(altitude_m, 11000.0))
+
+    T = T0 - L * h
+    if T <= 0:
+        return ias_ms
+
+    exponent = g / (R * L) - 1.0  # ≈ 4.2559
+    density_ratio = (T / T0) ** exponent  # rho / rho0
+
+    if density_ratio <= 0:
+        return ias_ms
+
+    return ias_ms / math.sqrt(density_ratio)
+
+
 class NMEAConverter:
     """
     Converts Aerofly data to NMEA sentences for XCSoar.
@@ -208,7 +470,8 @@ class NMEAConverter:
         self.debug_level = debug_level
 
     def create_nmea_sentences(self, gps: GPSData, attitude: AttitudeData,
-                              vario: Optional['VarioCalculator'] = None) -> List[str]:
+                              vario: Optional['VarioCalculator'] = None,
+                              dll_connected: bool = False) -> List[str]:
         """Create appropriate NMEA sentences from Aerofly data."""
         sentences = []
 
@@ -241,6 +504,11 @@ class NMEAConverter:
             # Add vario + altitude + TAS (PTAS1) if vario data is available
             if vario and vario.is_valid:
                 sentences.append(self._create_ptas1_sentence(gps, vario))
+
+            # Add LXWP0 sentence when DLL provides IAS and wind data
+            # (Condor-compatible format parsed by XCSoar Condor3 driver)
+            if dll_connected and gps.indicated_airspeed is not None:
+                sentences.append(self._create_lxwp0_sentence(gps, attitude))
 
         return sentences
 
@@ -371,6 +639,56 @@ class NMEAConverter:
         tas_raw = int(round(tas_knots))
 
         parts = ["PTAS1", str(vario_raw), str(avg_vario_raw), str(alt_raw), str(tas_raw)]
+        sentence = ",".join(parts)
+        checksum = self._calculate_checksum(sentence)
+        return f"${sentence}*{checksum}"
+
+    def _create_lxwp0_sentence(self, gps: GPSData, attitude: AttitudeData) -> str:
+        """Create $LXWP0 sentence (LX Navigation format, same as Condor 3).
+        XCSoar Condor3 driver parses this for TAS, baro alt, vario, and wind.
+        Format: $LXWP0,<logger>,<TAS_kph>,<baro_alt_m>,<vario_ms>,,,,,,<heading>,<wind_dir>,<wind_speed_kph>
+
+        Wind direction follows Condor 3 convention: direction wind is coming FROM.
+        """
+        # TAS from IAS using ISA atmosphere model
+        ias_ms = gps.indicated_airspeed if gps.indicated_airspeed is not None else 0.0
+        alt_m = gps.barometric_altitude if gps.barometric_altitude is not None else gps.altitude
+        tas_ms = ias_to_tas(ias_ms, alt_m)
+        tas_kph = tas_ms * 3.6
+
+        # Vario (direct from DLL)
+        vario_ms = gps.vertical_speed if gps.vertical_speed is not None else 0.0
+
+        # Heading
+        heading = attitude.true_heading if attitude and attitude.timestamp > 0 else 0.0
+
+        # Wind: convert Vector3D (m/s) to direction (FROM) and speed (kph)
+        # AFS4 Vector3D axes: x = North, y = Up, z = East
+        # Use x (North) and z (East) for horizontal wind, ignore y (vertical)
+        wn = gps.wind_x if gps.wind_x is not None else 0.0  # North component
+        we = gps.wind_z if gps.wind_z is not None else 0.0  # East component
+        wind_speed_ms = math.sqrt(wn * wn + we * we)
+        wind_speed_kph = wind_speed_ms * 3.6
+
+        # AFS4 wind vector already points in the FROM direction (not air velocity).
+        # atan2(East, North) directly gives the meteorological "from" direction.
+        if wind_speed_ms > 0.1:
+            wind_dir = math.degrees(math.atan2(we, wn)) % 360.0
+        else:
+            wind_dir = 0.0
+
+        parts = [
+            "LXWP0",
+            "Y",                        # logger_stored
+            f"{tas_kph:.1f}",           # TAS in kph
+            f"{alt_m:.1f}",             # baro altitude in meters
+            f"{vario_ms:.2f}",          # vario in m/s
+            "", "", "", "", "",         # fields 4-8 (unused)
+            f"{heading:.0f}",           # heading of plane
+            f"{wind_dir:.0f}",          # wind course (FROM, degrees)
+            f"{wind_speed_kph:.1f}",    # wind speed in kph
+        ]
+
         sentence = ",".join(parts)
         checksum = self._calculate_checksum(sentence)
         return f"${sentence}*{checksum}"
@@ -567,37 +885,42 @@ class TCPServer:
 class AeroflyToXCSoar:
     """
     Main application class that coordinates the UDP receiver,
-    NMEA converter, and TCP server.
+    DLL reader (optional), NMEA converter, and TCP server.
     """
-    def __init__(self, udp_port=DEFAULT_UDP_PORT, tcp_port=DEFAULT_TCP_PORT, 
+    def __init__(self, udp_port=DEFAULT_UDP_PORT, tcp_port=DEFAULT_TCP_PORT,
                  update_rate=DEFAULT_UPDATE_RATE, magnetic_variation=DEFAULT_MAGNETIC_VARIATION,
-                 debug_level=DEFAULT_DEBUG_LEVEL):
+                 debug_level=DEFAULT_DEBUG_LEVEL, use_dll=True):
         self.udp_port = udp_port
         self.tcp_port = tcp_port
         self.update_rate = update_rate
         self.update_interval = 1.0 / update_rate if update_rate > 0 else 0.2
         self.debug_level = debug_level
         self.magnetic_variation = magnetic_variation
-        
+        self.use_dll = use_dll
+
         # Initialize components
         self.receiver = AeroflyReceiver(udp_port, debug_level)
+        self.dll_reader = DLLReader(debug_level) if use_dll else None
         self.converter = NMEAConverter(magnetic_variation, debug_level)
         self.tcp_server = TCPServer(tcp_port, debug_level)
         self.vario_calculator = VarioCalculator()
-        
+
         self.running = False
         self.main_thread = None
         self.start_time = time.time()
         self.sentences_count = 0
 
     def start_services(self):
-        """Start all background services (receiver, TCP server, processing loop)."""
+        """Start all background services (receiver, DLL reader, TCP server, processing loop)."""
         print(f"Starting Aerofly FS4 to XCSoar NMEA converter v{VERSION}...")
         print(f"UDP Port: {self.udp_port}, TCP Port: {self.tcp_port}")
         print(f"Update rate: {self.update_rate} Hz, Magnetic variation: {self.magnetic_variation}°")
+        print(f"DLL support: {'enabled' if self.use_dll else 'disabled'}")
         print(f"Debug level: {self.debug_level}")
 
         self.receiver.start()
+        if self.dll_reader:
+            self.dll_reader.start()
         self.tcp_server.start()
 
         self.running = True
@@ -622,16 +945,51 @@ class AeroflyToXCSoar:
 
     def get_status(self) -> dict:
         """Return current status for GUI consumption."""
-        gps = self.receiver.gps_data
-        att = self.receiver.attitude_data
+        dll_connected = self.dll_reader and self.dll_reader.is_connected()
+
+        # DLL data takes priority over UDP
+        if dll_connected:
+            gps = self.dll_reader.gps_data
+            att = self.dll_reader.attitude_data
+        else:
+            gps = self.receiver.gps_data
+            att = self.receiver.attitude_data
+
         with self.tcp_server.clients_lock:
             client_count = len(self.tcp_server.clients)
         runtime = time.time() - self.start_time if self.running else 0
         rate = self.sentences_count / runtime if runtime > 0 else 0
 
+        # Vario: prefer DLL direct value over calculated
+        if dll_connected and gps.vertical_speed is not None:
+            vario_val = gps.vertical_speed
+            avg_vario_val = gps.vertical_speed  # DLL has no avg, use instant
+        elif self.vario_calculator.is_valid:
+            vario_val = self.vario_calculator.vario
+            avg_vario_val = self.vario_calculator.average_vario
+        else:
+            vario_val = None
+            avg_vario_val = None
+
+        # IAS/TAS when DLL available
+        ias_ms = gps.indicated_airspeed
+        tas_ms = ias_to_tas(ias_ms, gps.altitude) if ias_ms is not None else None
+
+        # Wind when DLL available
+        # AFS4 wind vector points in FROM direction (not air velocity)
+        if gps.wind_x is not None and gps.wind_z is not None:
+            wn, we = gps.wind_x, gps.wind_z  # North, East (after ECEF→ENU)
+            wind_speed_ms = math.sqrt(wn**2 + we**2)
+            wind_dir = math.degrees(math.atan2(we, wn)) % 360.0 if wind_speed_ms > 0.1 else 0.0
+        else:
+            wind_speed_ms = None
+            wind_dir = None
+
         return {
             'running': self.running,
-            'afs4_connected': self.receiver.is_connected(),
+            'afs4_connected': self.receiver.is_connected() or dll_connected,
+            'dll_connected': dll_connected,
+            'data_source': 'DLL' if dll_connected else 'UDP',
             'xcsoar_clients': client_count,
             'latitude': gps.latitude,
             'longitude': gps.longitude,
@@ -643,8 +1001,12 @@ class AeroflyToXCSoar:
             'heading': att.true_heading,
             'pitch': att.pitch,
             'roll': att.roll,
-            'vario': self.vario_calculator.vario if self.vario_calculator.is_valid else None,
-            'avg_vario': self.vario_calculator.average_vario if self.vario_calculator.is_valid else None,
+            'vario': vario_val,
+            'avg_vario': avg_vario_val,
+            'ias_kts': ias_ms * 1.94384 if ias_ms is not None else None,
+            'tas_kts': tas_ms * 1.94384 if tas_ms is not None else None,
+            'wind_speed_kts': wind_speed_ms * 1.94384 if wind_speed_ms is not None else None,
+            'wind_dir': wind_dir,
             'sentences_count': self.sentences_count,
             'sentences_rate': rate,
             'uptime': runtime,
@@ -659,7 +1021,11 @@ class AeroflyToXCSoar:
         print("   - Port: TCP Client")
         print(f"   - IP Address: 127.0.0.1 (or this computer's IP for network)")
         print(f"   - TCP Port: {self.tcp_port}")
-        print("   - Driver: Generic")
+        if self.use_dll:
+            print("   - Driver: Condor3 (recommended with DLL for TAS/vario/wind)")
+            print("     OR Driver: Generic (basic mode, works with and without DLL)")
+        else:
+            print("   - Driver: Generic")
         print("3. Activate the device and ensure it says 'Connected'")
         print("===========================================\n")
 
@@ -667,24 +1033,33 @@ class AeroflyToXCSoar:
         """Main processing loop to convert data and send to TCP clients."""
         last_update_time = 0
         last_stats_time = 0
-        
+
         while self.running:
             current_time = time.time()
-            
+
             # Check if it's time to send an update
             if current_time - last_update_time >= self.update_interval:
-                # Get latest data
-                gps_data = self.receiver.gps_data
-                attitude_data = self.receiver.attitude_data
+                # DLL data takes priority over UDP
+                dll_connected = self.dll_reader and self.dll_reader.is_connected()
+                if dll_connected:
+                    gps_data = self.dll_reader.gps_data
+                    attitude_data = self.dll_reader.attitude_data
+                else:
+                    gps_data = self.receiver.gps_data
+                    attitude_data = self.receiver.attitude_data
 
-                # Update vario calculator with latest altitude
+                # Update vario calculator (still useful as fallback and for avg vario)
                 if gps_data.timestamp > 0:
                     self.vario_calculator.update(gps_data.altitude, gps_data.timestamp)
 
-                # Convert to NMEA (pass vario calculator for PTAS1 sentence)
+                # When DLL provides direct vertical_speed, feed it into PTAS1 via GPSData
+                # (gps_data.vertical_speed is already set by DLLReader)
+
+                # Convert to NMEA
                 nmea_sentences = self.converter.create_nmea_sentences(
-                    gps_data, attitude_data, self.vario_calculator)
-                
+                    gps_data, attitude_data, self.vario_calculator,
+                    dll_connected=dll_connected)
+
                 # Validate sentences before sending
                 valid_sentences = []
                 for sentence in nmea_sentences:
@@ -692,32 +1067,38 @@ class AeroflyToXCSoar:
                         valid_sentences.append(sentence)
                     else:
                         print(f"Invalid NMEA sentence detected: {sentence}")
-                
+
                 # Send to TCP clients
                 for sentence in valid_sentences:
                     self.tcp_server.send_to_all_clients(sentence)
                     self.sentences_count += 1
-                
+
                 # Update last update time
                 last_update_time = current_time
-            
+
             # Periodically show statistics (every 10 seconds)
             if current_time - last_stats_time >= 10:
                 with self.tcp_server.clients_lock:
                     client_count = len(self.tcp_server.clients)
-                
+
                 runtime = current_time - self.start_time
                 rate = self.sentences_count / runtime if runtime > 0 else 0
-                
-                vario_str = f", Vario: {self.vario_calculator.vario:+.1f} m/s" if self.vario_calculator.is_valid else ""
-                print(f"Status: {self.sentences_count} NMEA sentences sent ({rate:.1f}/sec) to {client_count} client(s){vario_str}")
-                
+
+                dll_connected = self.dll_reader and self.dll_reader.is_connected()
+                source = "[DLL]" if dll_connected else "[UDP]"
+                vario_str = ""
+                if dll_connected and self.dll_reader.gps_data.vertical_speed is not None:
+                    vario_str = f", Vario: {self.dll_reader.gps_data.vertical_speed:+.1f} m/s"
+                elif self.vario_calculator.is_valid:
+                    vario_str = f", Vario: {self.vario_calculator.vario:+.1f} m/s"
+                print(f"{source} {self.sentences_count} NMEA sent ({rate:.1f}/sec) to {client_count} client(s){vario_str}")
+
                 # If no clients are connected and debug level is > 0, remind about XCSoar configuration
                 if client_count == 0 and self.debug_level >= 1:
                     print("No clients connected! Make sure XCSoar is properly configured.")
-                
+
                 last_stats_time = current_time
-            
+
             # Sleep a bit to avoid busy waiting
             time.sleep(0.01)
 
@@ -725,6 +1106,8 @@ class AeroflyToXCSoar:
         """Stop all components."""
         self.running = False
         self.receiver.stop()
+        if self.dll_reader:
+            self.dll_reader.stop()
         self.tcp_server.stop()
         print("Aerofly FS4 to XCSoar converter stopped.")
 
@@ -745,7 +1128,7 @@ class BridgeGUI:
 
         self.root = tk.Tk()
         self.root.title(f"AFS4 → XCSoar Bridge v{VERSION}")
-        self.root.geometry("420x380")
+        self.root.geometry("420x480")
         self.root.resizable(False, False)
         self.root.configure(bg=self.COLOR_BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -757,9 +1140,9 @@ class BridgeGUI:
     def _build_ui(self):
         bg = self.COLOR_BG
 
-        # Status bar
+        # Status bar (row 1: AFS4 + XCSoar)
         status_frame = tk.Frame(self.root, bg=bg)
-        status_frame.pack(fill="x", padx=10, pady=(8, 4))
+        status_frame.pack(fill="x", padx=10, pady=(8, 2))
 
         self.lbl_afs4 = tk.Label(status_frame, text="● AFS4: ---", font=self.FONT_STATUS,
                                   fg=self.COLOR_RED, bg=bg, anchor="w")
@@ -768,6 +1151,18 @@ class BridgeGUI:
         self.lbl_xcsoar = tk.Label(status_frame, text="● XCSoar: ---", font=self.FONT_STATUS,
                                     fg=self.COLOR_RED, bg=bg, anchor="e")
         self.lbl_xcsoar.pack(side="right", expand=True, fill="x")
+
+        # Status bar (row 2: DLL + data source)
+        dll_frame = tk.Frame(self.root, bg=bg)
+        dll_frame.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.lbl_dll = tk.Label(dll_frame, text="● DLL: ---", font=self.FONT_STATUS,
+                                fg=self.COLOR_RED, bg=bg, anchor="w")
+        self.lbl_dll.pack(side="left", expand=True, fill="x")
+
+        self.lbl_source = tk.Label(dll_frame, text="Source: ---", font=self.FONT_STATUS,
+                                    fg="#666666", bg=bg, anchor="e")
+        self.lbl_source.pack(side="right", expand=True, fill="x")
 
         # Separator
         tk.Frame(self.root, height=1, bg="#cccccc").pack(fill="x", padx=10, pady=2)
@@ -781,10 +1176,12 @@ class BridgeGUI:
         fields = [
             ("altitude", "Altitude"),
             ("speed", "Speed"),
+            ("ias_tas", "IAS / TAS"),
             ("heading", "Heading"),
             ("track", "Track"),
             ("vario", "Vario"),
             ("avg_vario", "Avg Vario"),
+            ("wind", "Wind"),
         ]
         for i, (key, label) in enumerate(fields):
             tk.Label(data_frame, text=f"{label}:", font=self.FONT_LABEL, bg=bg,
@@ -864,11 +1261,28 @@ class BridgeGUI:
         else:
             self.lbl_xcsoar.config(text="● XCSoar: No clients", fg=self.COLOR_RED)
 
+        # DLL status
+        if s['dll_connected']:
+            self.lbl_dll.config(text="● DLL: Connected", fg=self.COLOR_GREEN)
+        elif self.bridge.use_dll:
+            self.lbl_dll.config(text="● DLL: Not found", fg=self.COLOR_RED)
+        else:
+            self.lbl_dll.config(text="● DLL: Disabled", fg="#999999")
+
+        self.lbl_source.config(text=f"Source: {s['data_source']}")
+
         # Flight data
         self.data_labels["altitude"].config(
             text=f"{s['altitude_m']:.0f} m  ({s['altitude_ft']:.0f} ft)")
         self.data_labels["speed"].config(
             text=f"{s['ground_speed_kmh']:.0f} km/h  ({s['ground_speed_kts']:.0f} kts)")
+
+        if s.get('ias_kts') is not None and s.get('tas_kts') is not None:
+            self.data_labels["ias_tas"].config(
+                text=f"{s['ias_kts']:.0f} / {s['tas_kts']:.0f} kts")
+        else:
+            self.data_labels["ias_tas"].config(text="--- (no DLL)")
+
         self.data_labels["heading"].config(text=f"{s['heading']:.1f}°")
         self.data_labels["track"].config(text=f"{s['track']:.1f}°")
 
@@ -883,6 +1297,12 @@ class BridgeGUI:
         else:
             self.data_labels["avg_vario"].config(text="---")
 
+        if s.get('wind_speed_kts') is not None and s.get('wind_dir') is not None:
+            self.data_labels["wind"].config(
+                text=f"{s['wind_dir']:.0f}° / {s['wind_speed_kts']:.0f} kts")
+        else:
+            self.data_labels["wind"].config(text="--- (no DLL)")
+
         # Footer
         self.lbl_nmea.config(text=f"NMEA: {s['sentences_count']} sent ({s['sentences_rate']:.1f}/sec)")
         uptime = int(s['uptime'])
@@ -892,6 +1312,8 @@ class BridgeGUI:
     def _reset_display(self):
         self.lbl_afs4.config(text="● AFS4: ---", fg=self.COLOR_RED)
         self.lbl_xcsoar.config(text="● XCSoar: ---", fg=self.COLOR_RED)
+        self.lbl_dll.config(text="● DLL: ---", fg=self.COLOR_RED)
+        self.lbl_source.config(text="Source: ---")
         for lbl in self.data_labels.values():
             lbl.config(text="---")
         self.lbl_nmea.config(text="NMEA: 0 sent (0.0/sec)")
@@ -925,6 +1347,9 @@ def main():
     parser.add_argument('--no-gui', action='store_true',
                         help='Run in terminal mode without GUI')
 
+    parser.add_argument('--no-dll', action='store_true',
+                        help='Disable DLL shared memory reader (UDP only)')
+
     parser.add_argument('--test', action='store_true',
                         help='Run in test mode (generate fake data if no Aerofly connection)')
 
@@ -935,7 +1360,8 @@ def main():
         tcp_port=args.tcp_port,
         update_rate=args.update_rate,
         magnetic_variation=args.mag_var,
-        debug_level=args.debug
+        debug_level=args.debug,
+        use_dll=not args.no_dll,
     )
 
     if args.no_gui:

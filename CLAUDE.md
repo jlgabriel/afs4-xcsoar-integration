@@ -9,47 +9,65 @@ Single-file Python application (`afs4-xcsoar-integration.py`) with these compone
 | Class | Responsibility |
 |-------|---------------|
 | `AeroflyReceiver` | UDP listener on port 49002, parses ForeFlight protocol (XGPS/XATT) |
-| `VarioCalculator` | Calculates vertical speed from altitude deltas (5-sample smooth, 30s average) |
-| `NMEAConverter` | Generates NMEA sentences: GPRMC, GPGGA, HCHDT, PGRMZ, PTAS1 |
+| `DLLReader` | Reads AeroflyReader DLL shared memory ("AeroflyReaderData") for IAS, vario, wind |
+| `VarioCalculator` | Calculates vertical speed from altitude deltas (fallback when no DLL) |
+| `NMEAConverter` | Generates NMEA sentences: GPRMC, GPGGA, HCHDT, PGRMZ, PTAS1, LXWP0 |
 | `TCPServer` | Serves NMEA to XCSoar clients on port 4353 |
-| `AeroflyToXCSoar` | Orchestrator: connects receiver → vario → converter → TCP |
-| `BridgeGUI` | Tkinter GUI with real-time flight data and connection status |
+| `AeroflyToXCSoar` | Orchestrator: DLL (preferred) or UDP → vario → converter → TCP |
+| `BridgeGUI` | Tkinter GUI with real-time flight data, DLL status, and connection status |
 
 ## Data flow
 
 ```
-AFS4 ──UDP 49002──► AeroflyReceiver ──► VarioCalculator
-                                    ──► NMEAConverter ──► TCPServer ──TCP 4353──► XCSoar
+AFS4 DLL → Shared Memory → DLLReader (50Hz, preferred)
+AFS4 UDP 49002 → AeroflyReceiver (fallback)
+                          ↓
+                    NMEAConverter → TCPServer → TCP 4353 → XCSoar
 ```
 
 ## NMEA sentences generated
 
 - **GPRMC** — position, speed, time, magnetic variation
 - **GPGGA** — position, altitude, fix quality
-- **HCHDT** — true heading (from XATT)
+- **HCHDT** — true heading (from XATT or DLL)
 - **PGRMZ** — barometric/pressure altitude in feet (parsed by XCSoar Generic driver)
 - **PTAS1** — vario, average vario, altitude, TAS (parsed by XCSoar Generic driver)
+- **LXWP0** — TAS, baro alt, vario, wind (DLL only; parsed by XCSoar Condor3 driver)
+
+## DLL integration
+
+The DLLReader connects to AeroflyReader DLL shared memory ("AeroflyReaderData") and provides:
+- **IAS** (indicated airspeed) → converted to **TAS** using ISA atmosphere model (`ias_to_tas()`)
+- **Vertical speed** (direct, 50-60Hz) — bypasses VarioCalculator smoothing
+- **Wind** (3D vector) → converted to direction/speed for LXWP0 sentence
+- Auto-reconnection if DLL disconnects, transparent fallback to UDP
+
+GPSData extended fields for DLL: `indicated_airspeed`, `wind_x`, `wind_y`, `wind_z` (all Optional[float]).
+
+## Shared memory layout (AeroflyReaderData)
+
+Key offsets used by DLLReader (based on C++ struct in `aerofly_reader_dll.cpp`):
+- Latitude/Longitude: offsets 16/24 (radians)
+- Altitude: offset 32 (meters MSL)
+- IAS: offset 80 (m/s)
+- Vertical speed: offset 96 (m/s)
+- Wind vector: offsets 192/200/208 (m/s, x/y/z components)
 
 ## Key constraints
 
-- **XCSoar must be in FLY mode** (not SIM) — SIM mode disables all device ports (confirmed in XCSoar source: `Descriptor.cpp` line 466)
-- XCSoar device config: TCP Client, 127.0.0.1:4353, Driver: Generic
+- **XCSoar must be in FLY mode** (not SIM) — SIM mode disables all device ports
+- XCSoar device config: TCP Client, 127.0.0.1:4353
+  - Driver: **Condor3** (recommended with DLL — gets TAS, vario, wind via LXWP0)
+  - Driver: **Generic** (basic mode, works with and without DLL)
 - No external dependencies — pure Python stdlib + tkinter
-- ForeFlight protocol only provides: lat, lon, alt MSL, track, groundspeed, heading, pitch, roll
-- Vario is calculated (not direct), so there's a small lag inherent to the smoothing
-
-## Future: DLL integration
-
-GPSData has `vertical_speed` and `barometric_altitude` fields (Optional) prepared for direct data from Aerofly-FS4-Bridge DLL. When DLL is connected:
-- `vertical_speed` will come direct instead of calculated
-- `barometric_altitude` will be actual baro alt instead of MSL
-- UDP will remain as fallback if DLL is not available
-- GUI will be enhanced for the DLL version
+- DLL shared memory is Windows-only (mmap)
+- `--no-dll` flag disables DLL reader (UDP only mode)
 
 ## Running
 
 ```bash
-python afs4-xcsoar-integration.py            # GUI mode (default)
-python afs4-xcsoar-integration.py --no-gui   # Terminal mode
-python afs4-xcsoar-integration.py --help     # All options
+python afs4-xcsoar-integration.py              # GUI mode with DLL support (default)
+python afs4-xcsoar-integration.py --no-dll     # GUI mode, UDP only
+python afs4-xcsoar-integration.py --no-gui     # Terminal mode
+python afs4-xcsoar-integration.py --help       # All options
 ```

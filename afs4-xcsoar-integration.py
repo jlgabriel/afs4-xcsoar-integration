@@ -30,7 +30,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Default configuration
 DEFAULT_UDP_PORT = 49002          # Aerofly FS4 default UDP port
@@ -272,8 +272,19 @@ class DLLReader:
         print("DLL reader started, looking for AeroflyReader shared memory...")
 
     def _try_connect(self) -> bool:
-        """Attempt to open the shared memory mapping."""
+        """Open existing shared memory (without creating a new one).
+        Uses ctypes OpenFileMappingW to avoid mmap(-1,...) which creates
+        an empty mapping if it doesn't exist yet, shadowing the DLL's real one.
+        """
         try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            FILE_MAP_READ = 0x0004
+            handle = kernel32.OpenFileMappingW(FILE_MAP_READ, False, self.MAPPING_NAME)
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
             self._mmap = mmap.mmap(-1, 1024, self.MAPPING_NAME, access=mmap.ACCESS_READ)
             self._connected = True
             if self.debug_level >= 1:
